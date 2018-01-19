@@ -1,6 +1,5 @@
 library(randomForest)
 library(glmnet)
-# devtools::install_github("stas-g/funfun")
 library(magrittr)
 library(parallel)
 library(plyr)
@@ -25,14 +24,12 @@ message('this is chromosome: ', k)
 message('this is dataset: ', a)
 message('this is method: ', m)
 
-FILE.P <- sprintf("model_output/chrm%s/%s_gwas_%m_preds/ichip", k, a, m)
-FILE.M <- sprintf("model_output/chrm%s/%s_gwas_%m_mods/ichip", k, a, m)
+FILE <- sprintf("model_output/chrm%s/%s_gwas_%m_mods/ichip", k, a, m)
 
 #--------------------------------------------------------------------------------
 #STL routine (lasso, RF)
-run.stl <- function(j){
+run.stl <- function(j, m){
   p <- pheno.names[i]
-  pred.f <- file.path(FILE.P, sprintf("%s-%s.rds", j, p))
   mod.f <- file.path(FILE.F, sprintf("%s-%s.rds", j, p))
 
   ##status == TRUE: fit the model, status == FALSE: proceed to next gene
@@ -43,7 +40,6 @@ run.stl <- function(j){
     if(exists('mod')) { if(!(class(mod) %in% c('cv.glmnet', 'randomForest'))) status <- TRUE else status <- FALSE }
   }
 
-  if(status){
     y <- E22[, j]
     pos.y <- t(p22[j, c("start_position", "end_position")])
     pos.x <- mysnps$position
@@ -51,22 +47,20 @@ run.stl <- function(j){
     X <- N22[, sel.x, drop = FALSE]
     X.new <- new.geno[, sel.x, drop = FALSE]
 
+  if(status){
     set.seed(123)
     if(m == 'lasso'){
       mod <- cv.glmnet(X, y, family = "gaussian", alpha = 1, standardize = FALSE)
       } else {
           mod <- randomForest(X, y, ntree = 500, importance = TRUE)
       }
-
-    pred <- predict(mod, X.new)
-    saveRDS(pred, file = pred.f)
     saveRDS(mod, file = mod.f)
 
     message(sprintf("STL: chrm %s gene %s: %s ok!", k, p, j))
   }
 
   message(sprintf("STL: chrm %s gene %s: %s done!", k, p, j))
-  pred <- readRDS(pred.f)
+  pred <- predict(mod, X.new)
   pred
 }
 
@@ -86,7 +80,7 @@ if(a == 'knight'){
   p22 <- probes[which(probes$chromosome_name == k), ]
 
   (load("knight-expression.RData")) # D
-  D <- D[-6]
+  D <- D[-6] #get rid of neutrophils
 
   new.geno <- get(load(sprintf("gwas-data/ichip/knight-%s.RData", k)))
   if(k == 16){
@@ -99,7 +93,6 @@ if(a == 'knight'){
   mysnps <- snps(new.geno)
   new.geno <- as(new.geno, 'numeric')
 }
-
 
 ##RAJ
 if(a == 'raj'){
@@ -142,7 +135,8 @@ if(a == 'raj'){
 # more pre-processing, running stl
 #-----------------------------------------------------------------------------------------
 
-pred <- vector('list', length(pheno.names)) #creating an empty list for results
+pred <- vector('list', length(pheno.names)) #creating empty lists for results
+names(pred) <- pheno.names
 ##iterating over cell types ---->>>>
 for(i in 1 : length(pheno.names)) {
     message('CELL ', pheno.names[i])
@@ -197,22 +191,18 @@ for(i in 1 : length(pheno.names)) {
 
   #RUN procedure
   res <- mclapply(iind, FUN = function(j){
-          message(exists('i'))
-          message(pheno.names[i])
+          message(sprintf('%s: %s - %s' , toupper(m), pheno.names[i], j))
 
-          message(j)
-          run.stl(j)
+          run.stl(j, m)
               }, mc.cores = 10) %>% do.call(cbind, .)
 
-    rownames(res) <- rownames(new.geno)
-    colnames(res) <- iind
-
+    dimnames(res) <- list(rownames(new.geno), iind)
     pred[[i]] <- res
 }
 
-names(pred) <- pheno.names
-
 saveRDS(pred, file = sprintf("model_output/chrm%s/%s_gwas_%s_ichip_preds.rds", k, a, m))
+
+q('no')
 
 #-----------------------------------------------------------------------------------------
 # aggregating results (Rsq)
@@ -248,4 +238,4 @@ rsq.lasso <- get.rsq('lasso')
 rsq.rf <- get.rsq('rf')
 
 
-q('no')
+##

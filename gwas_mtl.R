@@ -1,21 +1,15 @@
 library(randomForest)
-# devtools::install_github("stas-g/funfun")
-library(funfun)
 library(magrittr)
 library(parallel)
 library(plyr)
 library(annotSnpStats)
 
-setwd('/scratch/wallace/twas')
-#progress ind
+setwd('/rds/user/ng414/hpc-work/twas')
 DIST <- 1e7
 
 args_ <- commandArgs(trailingOnly = TRUE)
-if(length(args_) == 0) stop('must provide chromosome number and tissue type')
-print(args_)
-message('class(args_) ', class(args_))
+if(length(args_) < 3) stop('must provide chromosome number, data name and disease')
 k <- as.numeric(args_[1])
-message('this is chromosome ', k)
 a <- as.numeric(args_[2]) #a = {1, 2} = {knight, raj}
 d <- as.numeric(args_[3]) #d = {1, 2, 3} = {t1dgc+wtccc, jia, ms}
 
@@ -26,50 +20,21 @@ message('this is chromosome: ', k)
 message('this is dataset: ', a)
 message('this is disease: ', d)
 
-FILE <- sprintf("model_output/chrm%s/%s_gwas_preds/%s", k, a, d)
-
-# for(a in c('t1dgc+wtccc', 'jia', 'ms')){
-#   for(k in 1 : 22){
-#       FILE <- sprintf("model_output/chrm%s/raj_gwas_preds/%s", k, d)
-#       x <- list.files(FILE)
-#       # file.remove(file.path(FILE, x[grep('-raj-cd4-raj-cd14', x)]))
-#       print(x[grep('-raj-cd4-raj-cd14', x)])
-#   }
-# }
-
-#
-# for(k in 1 : 22){
-# for(a in c('knight', 'raj', 'ichip')){
-#   for(d in c('t1dgc+wtccc', 'jia', 'ms')){
-#     # FILE <- sprintf("rm /scratch/wallace/twas/model_output/chrm%s/%s_gwas_preds/%s/*", k, a, d)
-#     FILE  <- sprintf("rm /scratch/wallace/twas/model_output/chrm%s/gwas_mlt_%s_%s_res.rds", k, a, d)
-#     message(FILE)
-#   }
-# }
-# }
-#
-#
-ind <- rep(FALSE, 22)
-for(a in c('knight', 'raj')){
-  for(d in c('t1dgc+wtccc', 'jia', 'ms')){
-    file_ <- sprintf('ind-%s-%s_preds.rds', a, d)
-    message(file_)
-    saveRDS(ind, file = file_)
-  }
-}
-
-##check whether chrm k has already been completed, if so stop
-mm <- readRDS(sprintf('ind-%s-%s_preds.rds', a, d))
-if(mm[k]) stop(sprintf('chrm %s already done!', k))
+FILE.M <- sprintf("model_output/chrm%s/%s_gwas_mtl_mods/%s", k, a, d)
+FILE.P <- sprintf("model_output/chrm%s/%s_gwas_mtl_preds/%s", k, a, d)
 
 #--------------------------------------------------------------------------------
+#FUNCTIONS for grouping traits
+#--------------------------------------------------------------------------------
+
 #z = correlation matrix for various traits
 sieve <- function(z){
     z <- abs(z)
     cor.m <- colMeans(z)
-    #does the column/trait have at least one cor_pw < 0.3
-    ind <- colSums(z < 0.3) > 0
     print(cor.m)
+    #does the column/trait have at least one cor_pw < 0.3?
+    ind <- colSums(z < 0.3) > 0
+    #while there are still traits with any cor_pw < 0.3 and there are more than two traits in total, delete the cor_pw < 0.3 trait with the smallest average cor_pw
     while(any(ind)){
       #if z is a 2x2 matrix and there is still some cor_pw < 0.3, then there are no subgroups of interest, so stop
       if(nrow(z) < 3) {print('empty'); return(NULL)}
@@ -77,16 +42,17 @@ sieve <- function(z){
       i <- which(colnames(z) == i)
       z <- z[-i, -i]
       cor.m <- colMeans(z)
-      ind <- colSums(z < 0.3) > 0
       print(cor.m)
+      ind <- colSums(z < 0.3) > 0
     }
+    #names of the traits forming the largest group of variables with every cor_pw > 0.3
     names(ind)
 }
 
 #iterative application of the sieve algorithm to split all variables in z into "best" correlated groups
-#if sieve returns NA, then perform STL
-#if sieve returns a vector of length 5, then perform full MTL on all the tissues
-#if sieve returns a vector of length 2 or 3, then sieve for another cluster
+#if sieve returns NA, then there are no suitabe groups and we perform STL
+#if sieve returns a vector of length 5, then there is one group comprising all the tissue types and we perform full MTL on all the tissues
+#if sieve returns a vector of length 2 or 3, then the seived out 3, resp. 2, traits can potentially be formed into another cluster, so apply sieve again
 #z = correlation matrix as above
 
 group <- function(z){
@@ -95,17 +61,18 @@ group <- function(z){
   while(sum(lengths(gr.list)) < N & !is.null(z)){
       k <- length(gr.list)
       tr <- colnames(z)
-      #best group from traits tr of z
+      #best group from traits tr in full z cor matrix:
       tmp <- sieve(z)
       if(is.null(tmp)) {
+        #if can't find a cluster in z, then each trait in z forms its own singleton group
         gr.list <- c(gr.list, as.list(tr))
         } else {
           if(length(tmp) == ncol(z) - 1){
             gr.list <- c(gr.list, list(tmp), list(setdiff(tr, tmp)))
           } else {
             gr.list <- c(gr.list, list(tmp))
+            #if all traits in z form a cluster, then z is now empty and we can stop; else delete traits forming a new cluster from z and apply sieve again
             if(length(tmp) == ncol(z)) z <- NULL else z <- z[setdiff(tr, tmp), setdiff(tr, tmp)]
-            #if(length(tr) != length(tmp)) z <- z[setdiff(tr, tmp), setdiff(tr, tmp)] #!!! what happens if we get a whole group (after the split)
           }
     }
     message('')
@@ -115,16 +82,21 @@ group <- function(z){
 
 #--------------------------------------------------------------------------------
 #run MTL model
-#fit mlt rf given a gene j and a group of traits tr; save the model & return test predictions
+#fit MTL-RF given a gene j and a group of traits tr and a data type a {raj, knight}; save the model & return GWAS predictions
 run.mtl <- function(j, tr, a){
-  pred.f <- file.path(FILE, sprintf("%s-%s.rds", j, paste(tr, collapse = '-')))
+  mod.f <- file.path(FILE.M, sprintf("%s-%s.rds", j, paste(tr, collapse = '-')))
+  pred.f <- file.path(FILE.P, sprintf("%s-%s.rds", j, paste(tr, collapse = '-')))
 
   ##status == TRUE: fit the model, status == FALSE: proceed to next gene
-  if(!file.exists(pred.f)) status <- TRUE
-  if(file.exists(pred.f)) {
+  if(!file.exists(mod.f)) status <- TRUE
+  if(file.exists(mod.f)) {
     #if file exists but cannot be read set global status to TRUE
-    tryCatch(pred.sp <- readRDS(pred.f), error = function(e) status <<- TRUE)
-    if(exists('pred.sp')) { if(!(class(pred.sp) %in% c('matrix', 'numeric', 'data.frame'))) status <- TRUE else status <- FALSE }
+    tryCatch(mod <- readRDS(mod.f), error = function(e) status <<- TRUE)
+    if(exists('mod')) { if(class(mod) != 'randomForest') {
+       status <- TRUE
+       pred.sp <- readRDS(pred.f)
+        } else { status <- FALSE }
+     }
   }
 
   if(status) {
@@ -132,6 +104,7 @@ run.mtl <- function(j, tr, a){
     X <- X.mult[trait.id %in% tr, ]
     id <- droplevels(trait.id[trait.id %in% tr])
     X.new <- new.geno[tr]
+    #create tissue id for X.new
     new.id <- factor(rep(tr, sapply(X.new, nrow)), levels = tr)
     ##
     if(a == 'raj'){
@@ -146,13 +119,10 @@ run.mtl <- function(j, tr, a){
     } else {
       pos.x <- mysnps[[1]][colnames(X), ]$position
     }
+    #selecting SNPs in the DIST envelope within the probe
     sel.x <- pmin(abs(pos.x - pos.y[1]), abs(pos.x - pos.y[2])) < DIST
     X <- X[, sel.x, drop = FALSE]
     X.new <- X.new[, sel.x, drop = FALSE]
-
-    # ind.g <- intersect(colnames(X), colnames(X.new))
-    # X.new <- X.new[, ind.g]
-    # X <- X[, ind.g]
 
     suppressWarnings(X <- data.frame(id = id, X))
     suppressWarnings(X.new <- data.frame(id = new.id, X.new))
@@ -164,6 +134,7 @@ run.mtl <- function(j, tr, a){
     pred.sp <- split(pred, X.new$id) %>% do.call(cbind, .)
     colnames(pred.sp) <- paste0(tr, ".", j, "_", k)
 
+    saveRDS(mod, file = mod.f)
     saveRDS(pred.sp, file = pred.f)
     message(sprintf("MTL: chrm %s gene %s: %s ok!", k, j, paste(tr, collapse = ' ')))
     }
@@ -173,17 +144,21 @@ run.mtl <- function(j, tr, a){
   pred.sp
 }
 
-#run STL model
+#run STL-RF model for probe j, trace tr and dataset a
 run.stl <- function(j, tr, a){
-
-  pred.f <- file.path(FILE, sprintf("%s-%s.rds", j, tr))
+  mod.f <- file.path(FILE.M, sprintf("%s-%s.rds", j, tr))
+  pred.f <- file.path(FILE.P, sprintf("%s-%s.rds", j, tr))
 
   ##status == TRUE: fit the model, status == FALSE: proceed to next gene
-  if(!file.exists(pred.f)) status <- TRUE
-  if(file.exists(pred.f)) {
+  if(!file.exists(mod.f)) status <- TRUE
+  if(file.exists(mod.f)) {
     #if file exists but cannot be read set global status to TRUE
-    tryCatch(pred <- readRDS(pred.f), error = function(e) status <<- TRUE)
-    if(exists('pred')) { if(!(class(pred) %in% c('numeric', 'data.frame'))) status <- TRUE else status <- FALSE }
+    tryCatch(mod <- readRDS(mod.f), error = function(e) status <<- TRUE)
+    if(exists('mod')) { if(class(mod) != 'randomForest') {
+       status <- TRUE
+       pred <- readRDS(pred.f)
+        } else { status <- FALSE }
+     }
   }
 
   if(status){
@@ -199,10 +174,6 @@ run.stl <- function(j, tr, a){
     X <- X[[tr]][, sel.x, drop = FALSE]
     X.new <- new.geno[[tr]][, sel.x, drop = FALSE]
 
-    # ind.g <- intersect(colnames(X), colnames(X.new))
-    # X.new <- X.new[, ind.g]
-    # X <- X[, ind.g]
-
     set.seed(123)
     mod <- randomForest(X, y, ntree = 500, importance = TRUE)
     pred <- predict(mod, X.new)
@@ -211,10 +182,10 @@ run.stl <- function(j, tr, a){
     colnames(pred) <- paste0(tr, ".", j, "_", k)
 
     saveRDS(pred, file = pred.f)
-    message(sprintf("STL: chrm %s gene %s: %s ok!", k, j, paste(tr, collapse = ' ')))
+    message(sprintf("STL: chrm %s gene %s: %s ok!", k, j, tr))
   }
 
-  message(sprintf("STL: chrm %s gene %s: %s done!", k, j, paste(tr, collapse = ' ')))
+  message(sprintf("STL: chrm %s gene %s: %s done!", k, j, tr))
   pred
 }
 
@@ -284,7 +255,6 @@ if(a == 'raj'){
   #which genes have sufficient signal in at least one tissue type?
   pvals <- pvals[apply(pvals, 1, FUN = function(x) any(x <= 1e-07)), ]
 }
-#-----------------------------------------------------------------------------------------
 
 #-----------------------------------------------------------------------------------------
 # constructing .mult objects in preparation for analysis
@@ -332,7 +302,6 @@ if(a == 'raj'){
 
       E22 <- scale(E22)
       N22 <- as(N22, 'numeric')
-      set.seed(100)
 
       X.mult[[i]] <- N22
       D.mult[[i]] <- E22
@@ -344,11 +313,14 @@ if(a == 'raj'){
 z <- sapply(X.mult, nrow) #same as sapply(D.mult, nrow)
 trait.id <- factor(rep(names(z), z), levels = pheno.names)
 
+#creating stacked X-matrix
 X <- X.mult
 if(a == 'raj'){
+  #only include probes featuring for both cell types
   pp <- intersect(colnames(X.mult[[1]]), colnames(X.mult[[2]]))
   for(i in 1 : 2) X.mult[[i]] <- X.mult[[i]][, pp]
 }
+#stacking geno-matrices for different cell types
 X.mult <- do.call(rbind, X.mult)
 
 #-----------------------------------------------------------------------------------------
@@ -358,6 +330,7 @@ X.mult <- do.call(rbind, X.mult)
 trait.groups <- lapply(rownames(pvals), FUN = function(j){
   message()
   message(j)
+  #accumulating expression data across cell types and binding it in a data.frame
   zz <- lapply(D.mult, FUN = function(x) as.data.frame(t(x[, j, drop = FALSE])))
   zz <- t(rbind.fill(zz))
   colnames(zz) <- names(D.mult)
@@ -365,9 +338,10 @@ trait.groups <- lapply(rownames(pvals), FUN = function(j){
 
   group(z)
   })
-
-all(sapply(trait.groups, FUN = function(x) sum(lengths(x))) == length(pheno.names))
 names(trait.groups) <- rownames(pvals)
+
+#check that for each probe groups contain all cell types
+all(sapply(trait.groups, FUN = function(x) sum(lengths(x))) == length(pheno.names))
 
 #sieve out groups for which the pval_min requirement is not satisfied
 groups.fin <- lapply(names(trait.groups), FUN = function(j){
