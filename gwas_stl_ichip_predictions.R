@@ -15,7 +15,7 @@ print(args_)
 message('class(args_) ', class(args_))
 k <- as.numeric(args_[1])
 a <- as.numeric(args_[2]) #a = {1, 2} = {knight, raj}
-m <- as.numeric(args_[3]) #m = {1, 2} = {lasso, rf}
+m <- as.numeric(args_[3]) #m = {1, 2} = {lasso, stl_rf}
 
 a <- c('knight', 'raj')[a]
 m <- c('lasso', 'rf')[m]
@@ -24,7 +24,7 @@ message('this is chromosome: ', k)
 message('this is dataset: ', a)
 message('this is method: ', m)
 
-FILE <- sprintf("model_output/chrm%s/%s_gwas_%m_mods/ichip", k, a, m)
+FILE <- sprintf("model_output/chrm%s/%s_gwas_%s_mods/ichip", k, a, m)
 
 #--------------------------------------------------------------------------------
 #STL routine (lasso, RF)
@@ -175,7 +175,7 @@ for(i in 1 : length(pheno.names)) {
         new.geno <- new.geno0[[i]]
       }
 
-  ##--------_>>>>>>>>>>>>>>>>>
+  ##-------->>>>>>>>>>>>>>>>>
   ##weeding out probes with nothing in the SNP catchment area (which is not uncommon due to clustering of SNPs in the iCHIP data)
   ww <- sapply(iind, FUN = function(j){
     pos.y <- t(p22[j, c("start_position", "end_position")])
@@ -187,7 +187,7 @@ for(i in 1 : length(pheno.names)) {
 
   #final list of probes for trainig and predictions
   iind <- names(which(ww > 1))
-  ##--------_>>>>>>>>>>>>>>>>>
+  ##-------->>>>>>>>>>>>>>>>>
 
   #RUN procedure
   res <- mclapply(iind, FUN = function(j){
@@ -207,6 +207,16 @@ q('no')
 #-----------------------------------------------------------------------------------------
 # aggregating results (Rsq)
 #-----------------------------------------------------------------------------------------
+# devtools::install_github('stas-g/MLhelper') #lasso.betas here
+library(MLhelper)
+library(glmnet)
+library(randomForest)
+
+#obtain variable importances from randomForest model mod and order from most to least important
+rf.varimp <- function(mod){
+  imp <- importance(mod)
+  imp[order(imp[, 1], decreasing = TRUE), ]
+}
 
 get.rsq <- function(m){
   mclapply(1 : 22 , FUN = function(k) {
@@ -219,11 +229,19 @@ get.rsq <- function(m){
               cell <- strsplit(z, "-|\\.")[[1]][2]
               if(m == 'lasso'){
                 rsq <- mod$glmnet.fit$dev.ratio[mod$glmnet.fit$lambda == mod$lambda.1se]
+                if(rsq == 0) {
+                  best.snp <- best.snp.coef <- NA
+                } else {
+                    best.snp.coef <- lasso.betas(mod)[1]
+                    best.snp <- names(best.snp.coef)
+                  }
               } else {
                 rsq <- mod$rsq[500]
+                best.snp.coef <- rf.varimp(mod)[, 1][1]
+                best.snp <- names(best.snp.coef)
               }
               message(sprintf('chr %s dataset %s disease %s: %s', k, a, d, z))
-              data.frame(probe = j, cell = cell, rsq = rsq)
+              data.frame(probe = j, cell = cell, rsq = rsq, best.snp = best.snp, best.snp.coef = best.snp.coef)
               }) %>% do.call(rbind, .)
         out$dat <- a
         out
@@ -235,7 +253,13 @@ get.rsq <- function(m){
 }
 
 rsq.lasso <- get.rsq('lasso')
-rsq.rf <- get.rsq('rf')
+rsq.rf <- get.rsq('stl_rf')
+
+rsq.lasso$ID <- paste(rsq.lasso$probe, rsq.lasso$cell, sep = '.')
+ID <- sapply(best.iind, FUN = function(z) sapply(1 : 5, FUN = function(i) paste(z, names(z)[i], sep = '.')))
+
+
+
 
 
 ##

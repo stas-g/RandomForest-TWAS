@@ -16,7 +16,7 @@ message('class(args_) ', class(args_))
 k <- as.numeric(args_[1])
 a <- as.numeric(args_[2]) #a = {1, 2} = {knight, raj}
 d <- as.numeric(args_[3]) #d = {1, 2, 3} = {t1dgc+wtccc, jia, ms}
-m <- as.numeric(args_[4]) #m = {1, 2} = {lasso, rf}
+m <- as.numeric(args_[4]) #m = {1, 2} = {lasso, stl_rf}
 
 a <- c('knight', 'raj')[a]
 d <- c('t1dgc+wtccc', 'jia', 'ms')[d]
@@ -186,6 +186,14 @@ q('no')
 #-----------------------------------------------------------------------------------------
 # aggregating results (Rsq)
 #-----------------------------------------------------------------------------------------
+devtools::install_github('stas-g/MLhelper') #lasso.betas here
+library(MLhelper)
+
+#obtain variable importances from randomForest model mod and order from most to least important
+rf.varimp <- function(mod){
+  imp <- importance(mod)
+  imp[order(imp[, 1], decreasing = TRUE), ]
+}
 
 get.rsq <- function(m){
   mclapply(1 : 22 , FUN = function(k) {
@@ -200,11 +208,13 @@ get.rsq <- function(m){
               cell <- strsplit(z, "-|\\.")[[1]][2]
               if(m == 'lasso'){
                 rsq <- mod$glmnet.fit$dev.ratio[mod$glmnet.fit$lambda == mod$lambda.1se]
+                if(rsq == 0) best.snp <- NA else best.snp <- lasso.betas(mod)[1]
               } else {
                 rsq <- mod$rsq[500]
+                best.snp <- rf.varimp(mod)[, 1][1]
               }
               message(sprintf('chr %s dataset %s disease %s: %s', k, a, d, z))
-              data.frame(probe = j, cell = cell, rsq = rsq)
+              data.frame(probe = j, cell = cell, rsq = rsq, best.snp = best.snp)
               }) %>% do.call(rbind, .)
          out$disease <- d
          out
@@ -219,7 +229,7 @@ get.rsq <- function(m){
 }
 
 rsq.lasso <- get.rsq('lasso')
-rsq.rf <- get.rsq('rf')
+rsq.rf <- get.rsq('stl_rf')
 
 
 ##

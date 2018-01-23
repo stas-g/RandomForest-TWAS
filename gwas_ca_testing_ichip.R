@@ -1,6 +1,6 @@
-#-----------------------------------------------------------------------------------
 #Cochran-Armitage 31.07.2017
 library(annotSnpStats)
+# devtools::install_github("stas-g/funfun")
 library(randomFunctions)
 library(magrittr)
 library(parallel)
